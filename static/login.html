@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Fortinet Dashboard</title>
+<style>
+  :root { --bg:#faf9f8; --card:#fff; --fg:#323130; --mut:#605e5c; --bd:#e1dfdd; --ac:#0f6cbd; --bad:#c50f1f; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1b1a19; --card:#252423; --fg:#f3f2f1; --mut:#a19f9d; --bd:#3b3a39; --ac:#6cb8f6; --bad:#f1707b; } }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg); font:14px/1.45 'Segoe UI',system-ui,sans-serif; }
+  form { background:var(--card); border:1px solid var(--bd); border-radius:2px; border-top:4px solid var(--ac); box-shadow:0 3px 8px rgba(0,0,0,.12); padding:28px; width:min(340px,92vw); display:grid; gap:12px; }
+  h1 { margin:0; font-size:20px; } p { margin:0; color:var(--mut); }
+  input, button { padding:10px 12px; border:1px solid var(--bd); border-radius:2px; font:inherit; background:var(--card); color:var(--fg); }
+  button { background:var(--ac); border-color:var(--ac); color:#fff; font-weight:600; cursor:pointer; }
+  @media (prefers-color-scheme: dark) { button { color:#08213a; } }
+  #err { color:var(--bad); min-height:1.4em; }
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>Fortinet Dashboard</h1>
+  <p>Sign in to continue.</p>
+  <input id="u" placeholder="Username" autocomplete="username" required autofocus>
+  <input id="p" type="password" placeholder="Password" autocomplete="current-password" required>
+  <button>Sign in</button>
+  <div id="err"></div>
+</form>
+<script>
+document.getElementById('f').onsubmit = async e => {
+  e.preventDefault();
+  const r = await fetch('/api/login', { method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'dashboard' },
+    body: JSON.stringify({ username: document.getElementById('u').value, password: document.getElementById('p').value }) });
+  if (r.ok) return location.href = '/';
+  document.getElementById('err').textContent = (await r.json().catch(() => ({}))).detail || 'Sign-in failed';
+};
+</script>
+</body>
+</html>

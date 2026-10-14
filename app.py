@@ -1,8 +1,15 @@
 """Simple read-only FortiManager / FortiGate dashboard. Run: uvicorn app:app --reload"""
 import asyncio
+import base64
+import contextvars
+import hashlib
+import hmac
 import json
+import logging
 import os
 import re
+import secrets
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -10,11 +17,29 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE = Path(__file__).parent
+
+
+def _load_env(path: Path) -> None:
+    """Read KEY=VALUE lines from .env so settings survive new PowerShell windows. Real env vars take priority."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            v = v.strip()
+            if len(v) > 1 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            os.environ.setdefault(k.strip(), v)
+
+
+_load_env(BASE / ".env")
 VERIFY = os.getenv("VERIFY_TLS", "true").lower() != "false"
 CA = os.getenv("CA_BUNDLE")  # optional custom CA bundle
 
@@ -43,11 +68,11 @@ FMG_CHECKS = {
     "tasks":           ("recent tasks", "/task/task"),
 }
 # No JSON-RPC/REST equivalent exists - these are CLI only (SSH), out of scope for an API-only tool.
-FMG_FIELDS = {"inventory": ["name", "hostname", "ip", "sn", "platform_str", "os_ver", "mr", "build", "patch",
+FMG_FIELDS = {"devices": ["name", "ip", "sn", "platform_str", "os_ver", "mr", "patch", "build",
+                          "conn_status", "conf_status", "db_status", "ha_mode", "ha_group_name"],  # like 'diagnose dvm device list'
+              "inventory": ["name", "hostname", "ip", "sn", "platform_str", "os_ver", "mr", "build", "patch",
                              "conn_status", "conf_status", "db_status", "dev_status", "ha_mode", "ha_group_name",
-                             "vdom", "desc"],
-              "crosscheck": ["name", "hostname", "ip", "sn", "os_ver", "mr", "patch", "build",
-                             "conn_status", "conf_status", "db_status", "ha_mode"]}
+                             "vdom", "desc"]}
 FMG_CLI_ONLY = [
     "diagnose cdb check objcfg-integrity",
     "diagnose cdb check policy-packages {adom}",
@@ -89,7 +114,7 @@ async def lifespan(_):
 app = FastAPI(title="Fortinet Read-Only Dashboard", lifespan=lifespan)
 
 
-async def fmg_get(url: str, fields: list[str] | None = None) -> dict:
+async def _fmg_raw(url: str, fields: list[str] | None = None) -> dict:
     if not (FMG_HOST and FMG_TOKEN):
         raise HTTPException(503, "Set FMG_HOST and FMG_TOKEN")
     params = {"url": url, **({"fields": fields} if fields else {})}
@@ -103,18 +128,21 @@ async def fmg_get(url: str, fields: list[str] | None = None) -> dict:
             raise HTTPException(502, f"FMG {FMG_HOST}: {type(e).__name__} {e}")
     res = r.json()["result"][0]
     if res["status"]["code"] != 0:
-        raise HTTPException(502, f"FMG: {res['status']['message']}")
+        msg = res["status"]["message"]
+        if "permission" in msg.lower():
+            msg += " (the API user's admin profile needs JSON API access = Read, Device Manager read access, and the ADOMs assigned)"
+        raise HTTPException(502, f"FMG: {msg}")
     return res.get("data")
 
 
-async def fgt_get(name: str, path: str, vdom: str | None) -> dict:
+async def _fgt_raw(name: str, path: str, vdom: str | None, extra: dict | None = None) -> dict:
     dev = DEVICES.get(name)
     if not dev:
         raise HTTPException(404, f"Unknown device '{name}'")
     token = os.getenv(dev["token_env"], "")
     if not token:
         raise HTTPException(503, f"Env var {dev['token_env']} is empty (token_env must be the variable NAME, not the token)")
-    params = {"vdom": vdom} if vdom else None
+    params = {**({"vdom": vdom} if vdom else {}), **(extra or {})} or None
     async with _slots:  # GET only
         try:
             r = await _http.get(f"https://{dev['host']}/api/v2/{path}", params=params,
@@ -126,6 +154,150 @@ async def fgt_get(name: str, path: str, vdom: str | None) -> dict:
     if r.status_code >= 400:
         raise HTTPException(502, f"FGT {name}: HTTP {r.status_code}")
     return r.json()
+
+# ---- login (single shared account; signed session cookie, stdlib only) ----
+# Set DASH_PASSWORD_HASH (python app.py hash <password>) or, for a lab, DASH_PASSWORD.
+DASH_USER = os.getenv("DASH_USER", "admin")
+_PW_HASH = os.getenv("DASH_PASSWORD_HASH", "")
+_PW_PLAIN = os.getenv("DASH_PASSWORD", "")
+SESSION_SECRET = (os.getenv("SESSION_SECRET") or secrets.token_hex(32)).encode()  # random => logins end on restart
+SESSION_HOURS = float(os.getenv("SESSION_HOURS", "8"))
+COOKIE = "fd_session"
+PUBLIC = {"/login", "/api/login"}
+_fails: dict[str, list[float]] = {}  # client ip -> recent failed-login times
+
+
+def _hash_pw(pw: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    return f"{salt}${hashlib.pbkdf2_hmac('sha256', pw.encode(), salt.encode(), 200_000).hex()}"
+
+
+def _check_pw(user: str, pw: str) -> bool:
+    ok_user = hmac.compare_digest(user.encode(), DASH_USER.encode())
+    if _PW_HASH:
+        ok_pw = hmac.compare_digest(_hash_pw(pw, _PW_HASH.split("$")[0]), _PW_HASH)
+    else:
+        ok_pw = hmac.compare_digest(pw.encode(), _PW_PLAIN.encode())
+    return ok_user and ok_pw
+
+
+def _sign(msg: str) -> str:
+    return hmac.new(SESSION_SECRET, msg.encode(), hashlib.sha256).hexdigest()
+
+
+def _make_session() -> str:
+    msg = base64.urlsafe_b64encode(f"{DASH_USER}|{int(time.time() + SESSION_HOURS * 3600)}".encode()).decode()
+    return f"{msg}.{_sign(msg)}"
+
+
+def _valid_session(tok: str | None) -> bool:
+    try:
+        msg, sig = (tok or "").rsplit(".", 1)
+        user, exp = base64.urlsafe_b64decode(msg).decode().split("|")
+        return hmac.compare_digest(sig, _sign(msg)) and user == DASH_USER and int(exp) > time.time()
+    except ValueError:
+        return False
+
+
+if not (_PW_HASH or _PW_PLAIN) and __name__ != "__main__":
+    raise RuntimeError("Set DASH_PASSWORD_HASH (python app.py hash <password>) or DASH_PASSWORD to enable the login")
+
+# ---- cache: every FMG/FGT call is cached; ?refresh=true on any API request bypasses it ----
+CACHE_TTL = float(os.getenv("CACHE_TTL_SECONDS", "300"))
+log = logging.getLogger("uvicorn.error")  # shows up in the uvicorn console
+_cache: dict[tuple, tuple[float, object]] = {}
+_locks: dict[tuple, asyncio.Lock] = {}
+_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar("req_ctx", default=None)
+
+
+async def _cached(key: tuple, fetch, use: bool = True):
+    ctx = _ctx.get()
+    if not use or ctx is None:
+        return await fetch()
+    async with _locks.setdefault(key, asyncio.Lock()):  # concurrent identical calls share one device request
+        hit = _cache.get(key)
+        if hit and not ctx["refresh"] and time.time() - hit[0] < CACHE_TTL:
+            ctx["hits"] += 1
+            ctx["oldest"] = min(ctx["oldest"] or hit[0], hit[0])
+            return hit[1]
+        log.info("DEVICE CALL %s", " ".join(str(k) for k in key if k))
+        val = await fetch()  # errors raise here and are never cached
+        if len(_cache) > 500:
+            for k in [k for k, (t, _) in _cache.items() if time.time() - t >= CACHE_TTL]:
+                _cache.pop(k, None)
+        _cache[key] = (time.time(), val)
+        ctx["misses"] += 1
+        return val
+
+
+async def fmg_get(url: str, fields: list[str] | None = None, use_cache: bool = True):
+    return await _cached(("fmg", url, tuple(fields or ())), lambda: _fmg_raw(url, fields), use_cache)
+
+
+async def fgt_get(name: str, path: str, vdom: str | None, extra: dict | None = None, use_cache: bool = True):
+    return await _cached(("fgt", name, path, vdom, tuple(sorted((extra or {}).items()))),
+                         lambda: _fgt_raw(name, path, vdom, extra), use_cache)
+
+
+@app.middleware("http")
+async def gate(request: Request, call_next):
+    ctx = {"refresh": request.query_params.get("refresh") == "true", "hits": 0, "misses": 0, "oldest": None}
+    _ctx.set(ctx)
+    if request.url.path not in PUBLIC and not _valid_session(request.cookies.get(COOKIE)):
+        if request.url.path.startswith("/api/") or request.method != "GET":
+            return JSONResponse({"detail": "Not authenticated"}, 401)
+        return RedirectResponse("/login")
+    if request.method == "POST" and request.headers.get("x-requested-with") != "dashboard":
+        return JSONResponse({"detail": "Missing X-Requested-With header"}, 403)  # CSRF guard
+    resp = await call_next(request)
+    if ctx["hits"] or ctx["misses"]:
+        resp.headers["X-Cache"] = "MISS" if ctx["misses"] else "HIT"
+        if not ctx["misses"]:
+            resp.headers["X-Cached-At"] = str(int(ctx["oldest"]))
+    return resp
+
+
+@app.get("/login")
+def login_page():
+    return FileResponse(BASE / "static" / "login.html")
+
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def login(body: LoginIn, request: Request):
+    ip = request.client.host if request.client else "?"
+    recent = [t for t in _fails.get(ip, []) if time.time() - t < 300]
+    if len(recent) >= 5:
+        raise HTTPException(429, "Too many failed attempts, try again in a few minutes")
+    if not _check_pw(body.username, body.password):
+        _fails[ip] = recent + [time.time()]
+        raise HTTPException(401, "Invalid username or password")
+    _fails.pop(ip, None)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(COOKIE, _make_session(), max_age=int(SESSION_HOURS * 3600), httponly=True,
+                    samesite="strict", secure=request.url.scheme == "https")
+    return resp
+
+
+@app.post("/api/logout")
+def logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(COOKIE)
+    return resp
+
+
+@app.post("/api/cache/clear")
+def cache_clear():
+    n = len(_cache)
+    _cache.clear()
+    return {"cleared": n}
+
+
+app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 
 
 @app.get("/")
@@ -159,8 +331,8 @@ async def health():
             return {"ok": False, "error": e.detail}
     names = list(DEVICES)
     results = await asyncio.gather(
-        probe(fmg_get("/sys/status")) if FMG_HOST else asyncio.sleep(0, {"ok": False, "error": "not configured"}),
-        *[probe(fgt_get(n, "monitor/system/status", None)) for n in names])
+        probe(fmg_get("/sys/status", use_cache=False)) if FMG_HOST else asyncio.sleep(0, {"ok": False, "error": "not configured"}),
+        *[probe(fgt_get(n, "monitor/system/status", None, use_cache=False)) for n in names])
     return {"fmg": results[0], "fgt": dict(zip(names, results[1:]))}
 
 
@@ -170,7 +342,7 @@ _SAFE = re.compile(r"[^\w.-]+")
 _SID = re.compile(r"^[\w.-]+$")
 
 
-TTL_HOURS = float(os.getenv("SNAPSHOT_TTL_HOURS", "24"))  # saved snapshots are deleted after this long
+TTL_HOURS = float(os.getenv("SNAPSHOT_TTL_HOURS", "168"))  # saved snapshots are deleted after this long
 
 
 def _purge():
@@ -211,7 +383,8 @@ def snapshot_list():
     for p in files:
         ts, label, source, target = (p.stem.split("__") + ["", "", "", ""])[:4]
         out.append({"id": p.stem, "time": ts, "label": label, "source": source, "target": target,
-                    "kb": p.stat().st_size // 1024})
+                    "kb": p.stat().st_size // 1024,
+                    "expires_in_h": max(0, round((p.stat().st_mtime + TTL_HOURS * 3600 - time.time()) / 3600, 1))})
     return out
 
 
@@ -222,74 +395,6 @@ def snapshot_get(sid: str):
     if not _SID.match(sid) or not p.is_file():
         raise HTTPException(404, "Snapshot not found")
     return FileResponse(p, media_type="application/json")
-
-
-# ---- cross-check: what FortiManager has recorded vs what each FortiGate reports live ----
-def _enum(v, names):
-    return str(v).lower().replace(" ", "") if isinstance(v, str) else names.get(v, "unknown")
-
-
-def _fmg_version(d):
-    try:
-        return f"{int(float(str(d.get('os_ver'))))}.{d.get('mr')}.{d.get('patch')}"
-    except (TypeError, ValueError):
-        return ""
-
-
-@app.get("/api/crosscheck")
-async def crosscheck():
-    names = list(DEVICES)
-
-    async def live(n):
-        try:
-            return await fgt_get(n, "monitor/system/status", None)
-        except HTTPException as e:
-            return {"error": e.detail}
-
-    fmg_err, fmg_devs = None, []
-    try:
-        fmg_devs = await fmg_get("/dvmdb/device", FMG_FIELDS["crosscheck"]) or []
-    except HTTPException as e:
-        fmg_err = e.detail
-    fgts = await asyncio.gather(*[live(n) for n in names])
-    by_sn = {str(d.get("sn", "")).lower(): d for d in fmg_devs if d.get("sn")}
-    rows = []
-    for n, st in zip(names, fgts):
-        row = {"device": n, "host": DEVICES[n]["host"], "fgt": None, "fmg": None, "findings": []}
-        add = lambda level, msg: row["findings"].append({"level": level, "msg": msg})
-        if "error" in st:
-            add("fail", f"FortiGate unreachable: {st['error']}")
-        else:
-            ver = str(st.get("version", "")).lstrip("v")
-            row["fgt"] = {"hostname": (st.get("results") or {}).get("hostname"), "serial": st.get("serial"),
-                          "version": ver, "build": st.get("build")}
-            m = by_sn.get(str(st.get("serial", "")).lower())
-            if fmg_err:
-                add("warn", f"FortiManager unavailable: {fmg_err}")
-            elif not m:
-                add("warn", "Serial not found in FortiManager (not managed, or different FMG)")
-            else:
-                conn = _enum(m.get("conn_status"), {1: "up", 2: "down"})
-                conf = _enum(m.get("conf_status"), {1: "insync", 2: "outofsync"})
-                db = _enum(m.get("db_status"), {1: "nomod", 2: "modified"})
-                row["fmg"] = {"name": m.get("name"), "version": _fmg_version(m), "build": m.get("build"),
-                              "conn_status": conn, "conf_status": conf, "db_status": db}
-                if row["fmg"]["version"] and row["fmg"]["version"] != ver:
-                    add("warn", f"Version mismatch: FortiManager {row['fmg']['version']} vs FortiGate {ver} (FMG inventory stale?)")
-                if m.get("build") and st.get("build") and int(m["build"]) != int(st["build"]):
-                    add("warn", f"Build mismatch: FortiManager {m['build']} vs FortiGate {st['build']}")
-                if conn != "up":
-                    add("fail", f"FortiManager connection status is {conn}")
-                if conf != "insync":
-                    add("warn", f"FortiManager config status is {conf}")
-                if db.startswith("mod"):
-                    add("warn", "Device DB modified on FortiManager (unsaved/unretrieved changes)")
-                if m.get("hostname") and row["fgt"]["hostname"] and m["hostname"] != row["fgt"]["hostname"]:
-                    add("info", f"Hostname differs: FMG {m['hostname']} vs FGT {row['fgt']['hostname']}")
-        levels = [f["level"] for f in row["findings"]]
-        row["level"] = "fail" if "fail" in levels else "warn" if "warn" in levels else "pass"
-        rows.append(row)
-    return {"fmg_error": fmg_err, "rows": rows}
 
 
 @app.get("/api/fmg/{check}")
@@ -304,8 +409,45 @@ async def fmg_check(check: str, adom: str = "root", device: str = ""):
     return await fmg_get(url.format(adom=adom, device=device), FMG_FIELDS.get(check))
 
 
+@app.get("/api/fgt/{name}/sessions")
+async def fgt_sessions(name: str, vdom: str | None = None, count: int = Query(1000, ge=1, le=20000),
+                       ip_version: Literal["ipv4", "ipv6", "both"] = "ipv4"):
+    """Session table entries (source/destination, policy, protocol, state, bytes...). Capped by `count`."""
+    return await fgt_get(name, "monitor/firewall/session", vdom, {"count": count, "ip_version": ip_version})
+
+
+@app.get("/api/fgt/{name}/sessions/validate")
+async def fgt_sessions_validate(name: str, vdom: str | None = None, min_sessions: int = 1, drop_pct: float = 70):
+    """Sanity-check the live session table: not empty, and not far below the recent average (traffic dropped?)."""
+    res = (await fgt_get(name, FGT_CHECKS["resources"][1], vdom)).get("results") or {}
+    findings, out = [], {}
+    for key in ("session", "session6"):
+        e = (res.get(key) or [{}])[0]
+        cur = e.get("current")
+        hist = e.get("historical") or {}
+        avg = next((hist[k].get("average") for k in ("1-hour", "30-min", "10-min", "1-min")
+                    if isinstance(hist.get(k), dict) and hist[k].get("average") is not None), None)
+        out[key] = {"current": cur, "recent_average": avg}
+        if cur is None:
+            findings.append({"level": "warn", "msg": f"{key}: no data returned"})
+        elif key == "session" and cur < min_sessions:
+            findings.append({"level": "fail", "msg": f"{key}: {cur} sessions (expected at least {min_sessions})"})
+        elif avg and cur < avg * drop_pct / 100:
+            findings.append({"level": "warn", "msg": f"{key}: {cur} is below {drop_pct:g}% of recent average {avg}"})
+    rate = (res.get("setup_rate") or [{}])[0].get("current")
+    if rate is not None:
+        out["setup_rate"] = rate
+    levels = {f["level"] for f in findings}
+    return {"device": name, "level": "fail" if "fail" in levels else "warn" if "warn" in levels else "pass",
+            "sessions": out, "findings": findings}
+
+
 @app.get("/api/fgt/{name}/{check}")
 async def fgt_check(name: str, check: str, vdom: str | None = None):
     if check not in FGT_CHECKS:
         raise HTTPException(404, "Unknown FGT check")
     return await fgt_get(name, FGT_CHECKS[check][1], vdom)
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["hash"] and len(sys.argv) == 3:
+    print(_hash_pw(sys.argv[2]))

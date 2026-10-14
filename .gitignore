@@ -1,2 +1,2 @@
-*json
-__pycache*
+snapshots/
+__pycache__/

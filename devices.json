@@ -1,0 +1,5 @@
+{
+  "FMG-LAB-02-TUFIN-Q": {"type": "fmg", "host": "192.168.0.200", "token_env": "FMG_TOKEN"},
+  "FGT-LAB-01": {"type": "fgt", "host": "192.168.0.217", "token_env": "FGT_LAB_01_TOKEN"},
+  "FGT-LAB-02": {"type": "fgt", "host": "192.168.0.218", "token_env": "FGT_LAB_02_TOKEN"}
+}
